@@ -1,113 +1,108 @@
-name: Auto Merge Valid PRs  # ← 必须与分支保护规则中的名称完全一致！
+name: Auto Merge Valid PRs
 
 on:
   pull_request_target:
     types: [opened, synchronize, reopened]
 
-# 最小权限声明（安全关键！）
+# 关键修复：显式声明所需权限（必须放在顶层！）
 permissions:
-  pull-requests: write  # 仅允许操作PR
-  contents: read        # 禁止直接修改代码
+  pull-requests: write  # 允许批准和合并PR
+  contents: read        # 仅读取代码（安全最小权限）
 
 jobs:
   validate-and-merge:
     runs-on: ubuntu-latest
     steps:
-      - name: 紧急熔断检查
+      - name: Emergency stop check
         run: |
           if [ "${{ vars.EMERGENCY_STOP || 'false' }}" == "true" ]; then
-            echo "紧急停止模式已激活！请查看仓库公告"
+            echo "EMERGENCY STOP MODE ACTIVATED! Check repository announcement"
             exit 1
           fi
 
-      - name: 获取PR代码
+      - name: Checkout PR code
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
-          # 关键：避免拉取整个历史（加速+安全）
           sparse-checkout: |
             notes/
 
-      - name: 验证PR内容
+      - name: Validate PR content
         id: validator
         run: |
-          USER_LOGIN="${{ github.actor }}"  # 获取PR提交者用户名
+          USER_LOGIN="${{ github.actor }}"
           PR_HEAD_REF="${{ github.event.pull_request.head.ref }}"
           
-          echo "验证中: @$USER_LOGIN 的 PR"
-          echo "分支名: $PR_HEAD_REF"
+          echo "Validating PR from @$USER_LOGIN"
+          echo "Branch name: $PR_HEAD_REF"
           
-          # 规则1: 分支名必须等于用户名
+          # Rule 1: Branch name must match username
           if [ "$PR_HEAD_REF" != "$USER_LOGIN" ]; then
-            echo "::error::分支名错误！必须命名为 '$USER_LOGIN' (当前: '$PR_HEAD_REF')"
+            echo "::error::BRANCH NAME ERROR! Must be named '$USER_LOGIN' (current: '$PR_HEAD_REF')"
             exit 1
           fi
           
-          # 规则2: 检查笔记文件
+          # Rule 2: Check note file
           NOTE_FILE="notes/${USER_LOGIN}.md"
           if [ ! -f "$NOTE_FILE" ]; then
             NOTE_FILE="notes/${USER_LOGIN}.txt"
             if [ ! -f "$NOTE_FILE" ]; then
-              echo "::error::未找到笔记文件！必须创建 'notes/${USER_LOGIN}.md' 或 '.txt'"
+              echo "::error::NOTE FILE NOT FOUND! Must create 'notes/${USER_LOGIN}.md' or '.txt'"
               exit 1
             fi
           fi
           
-          # 规则3: 检查文件内容
+          # Rule 3: Check file content
           if [ ! -s "$NOTE_FILE" ]; then
-            echo "::error::笔记文件不能为空！"
+            echo "::error::NOTE FILE CANNOT BE EMPTY!"
             exit 1
           fi
           
           LINE_COUNT=$(wc -l < "$NOTE_FILE")
+          echo "line_count=$LINE_COUNT" >> $GITHUB_OUTPUT
           if [ "$LINE_COUNT" -lt 3 ]; then
-            echo "::error::内容不足！笔记文件至少需要3行内容 (当前: $LINE_COUNT 行)"
+            echo "::error::INSUFFICIENT CONTENT! Note file requires at least 3 lines (current: $LINE_COUNT lines)"
             exit 1
           fi
           
-          # 规则4: 检查是否修改了其他文件
+          # Rule 4: Check for unauthorized file changes
           git diff --quiet ${{ github.event.pull_request.base.sha }} ${{ github.event.pull_request.head.sha }} -- . ':!notes/'
           if [ $? -ne 0 ]; then
-            echo "::error::禁止修改 notes/ 以外的文件！"
+            echo "::error::MODIFICATION VIOLATION! Only changes in notes/ directory allowed"
             git diff --name-only ${{ github.event.pull_request.base.sha }} ${{ github.event.pull_request.head.sha }} -- . ':!notes/' | while read file; do
-              echo "  → 修改了: $file"
+              echo "  -> Modified: $file"
             done
             exit 1
           fi
           
-          echo "验证通过！笔记文件: $NOTE_FILE ($LINE_COUNT 行)"
+          echo "VALIDATION PASSED! Note file: $NOTE_FILE ($LINE_COUNT lines)"
           echo "valid=true" >> $GITHUB_OUTPUT
 
-      - name: 自动批准并合并
+      - name: Auto approve and merge (fixed version)
         if: steps.validator.outputs.valid == 'true'
         uses: actions/github-script@v7
         with:
-          # 使用安全令牌（在仓库Secrets中配置）
-          github-token: ${{ secrets.AUTO_MERGE_TOKEN }}
+          # Critical fix 2: Use correct API path
           script: |
-            // 1. 添加批准评论
-            await github.pulls.createReview({
+            // 1. Approve PR - Use correct API path
+            await github.rest.pulls.createReview({
               owner: context.repo.owner,
               repo: context.repo.repo,
               pull_number: context.issue.number,
               event: 'APPROVE',
-              body: `**自动验证通过！**\n- 分支名正确: \`${context.payload.pull_request.head.ref}\`\n- 笔记文件有效: \`${context.payload.pull_request.user.login}\`\n- 内容行数: ${steps.validator.outputs.line_count || '3+'}\n\n即将自动合并到 main 分支...`
+              body: `AUTO VALIDATION PASSED!\n- Branch: \`${context.payload.pull_request.head.ref}\`\n- File: \`${context.payload.pull_request.user.login}.md\`\n- Lines: ${steps.validator.outputs.line_count}\n\nMerging automatically...`
             });
             
-            // 2. 执行合并（squash模式保持历史整洁）
-            await github.pulls.merge({
+            console.log('PR APPROVED');
+            
+            // 2. Merge PR - Use correct API path
+            await github.rest.pulls.merge({
               owner: context.repo.owner,
               repo: context.repo.repo,
               pull_number: context.issue.number,
               merge_method: 'squash',
-              commit_title: `添加笔记: ${context.payload.pull_request.user.login}`,
-              commit_message: `由 @${context.actor} 通过自动验证`
+              commit_title: `Add note: ${context.payload.pull_request.user.login}`,
+              commit_message: `Auto-validated contribution from @${context.actor}`
             });
             
-            console.log('PR 已成功自动合并到 main 分支！');
-
-      - name: 失败通知（仅调试用）
-        if: failure() && steps.validator.outputs.valid != 'true'
-        run: |
-          echo "验证失败原因已显示在PR检查结果中"
-          echo "学生可在此查看详细错误: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            console.log('PR SUCCESSFULLY MERGED TO MAIN BRANCH!');
